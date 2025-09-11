@@ -59,16 +59,16 @@ async function initDb() {
       message_id TEXT
     );
   `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS history (
-      id SERIAL PRIMARY KEY,
-      user_id TEXT,
-      username TEXT,
-      start BIGINT,
-      end BIGINT,
-      note TEXT
-    );
-  `);
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS history (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT,
+    username TEXT,
+    start BIGINT,
+    ended_at BIGINT,
+    note TEXT
+  );
+`);
   console.log('DB initialized');
 }
 
@@ -154,7 +154,8 @@ client.on('interactionCreate', async (interaction) => {
         }
         const get = r.rows[0];
         const now = Math.floor(Date.now() / 1000);
-        await pool.query('INSERT INTO history(user_id, username, start, end, note) VALUES($1,$2,$3,$4,$5)', [get.user_id, get.username, get.start, now, get.note]);
+        await pool.query('INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',[get.user_id, get.username, get.start, now, get.note]);
+
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
         await interaction.reply({ content: `退出を記録しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。`, ephemeral: true });
         const panels = await pool.query('SELECT channel_id FROM panel');
@@ -204,7 +205,8 @@ setInterval(async () => {
     const now = Math.floor(Date.now() / 1000);
     const rr = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users WHERE expected_end IS NOT NULL AND expected_end <= $1', [now]);
     for (const r of rr.rows) {
-      await pool.query('INSERT INTO history(user_id, username, start, end, note) VALUES($1,$2,$3,$4,$5)', [r.user_id, r.username, r.start, r.expected_end, r.note]);
+      await pool.query('INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',[r.user_id, r.username, r.start, r.expected_end, r.note]);
+
       await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
     }
     const panels = await pool.query('SELECT channel_id FROM panel');
@@ -227,3 +229,4 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
