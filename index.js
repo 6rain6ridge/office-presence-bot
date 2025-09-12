@@ -251,8 +251,46 @@ client.on('interactionCreate', async (interaction) => {
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
     }
-  } catch (err
+  } catch (err) {
+    console.error('interaction error:', err);
+    try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
+  }
+});
 
+// --- auto-expire ---
+setInterval(async () => {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const rr = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users WHERE expected_end IS NOT NULL AND expected_end <= $1', [now]);
+    for (const r of rr.rows) {
+      await pool.query(
+        'INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',
+        [r.user_id, r.username, r.start, r.expected_end, r.note]
+      );
+      await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
+
+      await sendLog(`⏰ ${r.username} 利用終了（開始: ${fmtTs(r.start)} → 自動終了: ${fmtHHMM(r.expected_end)}）${r.note ? ` ／メモ: ${r.note}` : ''}`);
+    }
+    const panels = await pool.query('SELECT channel_id FROM panel');
+    for (const p of panels.rows) await updatePanel(p.channel_id);
+  } catch (err) {
+    console.error('auto-expire error:', err);
+  }
+}, 60 * 1000);
+
+// --- start up ---
+(async () => {
+  try {
+    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set.');
+    await initDb();
+    app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
+    await client.login(DISCORD_TOKEN);
+    console.log('Discord client logged in');
+  } catch (err) {
+    console.error('startup error', err);
+    process.exit(1);
+  }
+})();
 
 
 
@@ -512,6 +550,7 @@ client.on('interactionCreate', async (interaction) => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
