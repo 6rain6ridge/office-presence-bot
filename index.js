@@ -12,6 +12,7 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  StringSelectMenuBuilder,
   InteractionType
 } = require('discord.js');
 
@@ -23,12 +24,12 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-// --- Express for Render health check (must bind PORT) ---
+// --- Express for health check ---
 const app = express();
 app.get('/', (req, res) => res.send('OK - office tracker'));
 const PORT = process.env.PORT || 10000;
 
-// --- Postgres (Neon) pool configuration ---
+// --- Postgres (Neon) pool ---
 const poolConfig = {
   connectionString: process.env.DATABASE_URL || null,
   max: process.env.PG_MAX ? Number(process.env.PG_MAX) : 5,
@@ -81,11 +82,10 @@ function fmtTs(ts) {
 }
 
 function panelComponents() {
-  const row = new ActionRowBuilder().addComponents(
+  return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('office_join').setLabel('利用します').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('office_leave').setLabel('退出します').setStyle(ButtonStyle.Danger)
-  );
-  return [row];
+  )];
 }
 
 async function buildPanelEmbed(channelId) {
@@ -95,7 +95,7 @@ async function buildPanelEmbed(channelId) {
   if (rows.length === 0) desc = '現在、事務所にいる人はいません。';
   else {
     for (const r of rows) {
-      desc += `• <@${r.user_id}> — 開始: ${fmtTs(r.start)} / 終了予定: ${r.expected_end ? fmtTs(r.expected_end) : '未設定'} ${r.note ? `／${r.note}` : ''}\n`;
+      desc += `• ${r.username} — 開始: ${fmtTs(r.start)} / 終了予定: ${r.expected_end ? fmtTs(r.expected_end) : '未設定'} ${r.note ? `／${r.note}` : ''}\n`;
     }
   }
   return new EmbedBuilder()
@@ -155,35 +155,39 @@ client.on('interactionCreate', async (interaction) => {
 
     // --- ボタン処理 ---
     if (interaction.isButton()) {
-      // 利用します → モーダル表示
       if (interaction.customId === 'office_join') {
-        // モーダル作成
-        const modal = new ModalBuilder()
-          .setCustomId('office_join_modal')
-          .setTitle('事務所利用登録');
+        // 利用時間選択モーダル作成
+        const modal = new ModalBuilder().setCustomId('office_join_modal').setTitle('事務所利用登録');
 
-        // 終了予定時刻（TextInput で 30分刻みを選択する形）
-        const timeInput = new TextInputBuilder()
-          .setCustomId('endTime')
-          .setLabel('終了予定時刻（例: 09:00, 13:30）')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false);
+        const timeSelect = new StringSelectMenuBuilder()
+          .setCustomId('useTime')
+          .setPlaceholder('利用時間を選択してください')
+          .addOptions([
+            { label: '1H', value: '1' },
+            { label: '2H', value: '2' },
+            { label: '3H', value: '3' },
+            { label: '5H', value: '5' },
+            { label: '6H', value: '6' },
+            { label: '7H', value: '7' },
+            { label: '10H', value: '10' },
+            { label: '未定', value: '0' }
+          ]);
 
-        // 用途メモ（任意）
         const noteInput = new TextInputBuilder()
           .setCustomId('note')
           .setLabel('用途やメモ（任意）')
           .setStyle(TextInputStyle.Short)
           .setRequired(false);
 
-        modal.addComponents(new ActionRowBuilder().addComponents(timeInput));
-        modal.addComponents(new ActionRowBuilder().addComponents(noteInput));
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(timeSelect),
+          new ActionRowBuilder().addComponents(noteInput)
+        );
 
         await interaction.showModal(modal);
         return;
       }
 
-      // 退出ボタン
       if (interaction.customId === 'office_leave') {
         const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
         if (!r.rows.length) {
@@ -199,7 +203,7 @@ client.on('interactionCreate', async (interaction) => {
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
         await interaction.deferUpdate();
 
-        await sendLog(`🟥 ${interaction.user.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
+        await sendLog(`🟥 ${get.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
 
         const panels = await pool.query('SELECT channel_id FROM panel');
         for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -215,42 +219,37 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const endTimeText = interaction.fields.getTextInputValue('endTime') || '';
+      const selectedTime = interaction.fields.getSelectMenuValues('useTime')[0] || '0';
       const note = interaction.fields.getTextInputValue('note') || '';
       let expectedEnd = null;
-
-      if (endTimeText) {
-        const m = endTimeText.match(/^(\d{1,2}):(\d{2})$/);
-        if (m) {
-          const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
-          const now = new Date();
-          const endDate = new Date(now);
-          endDate.setHours(hh, mm, 0, 0);
-          if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
-          expectedEnd = Math.floor(endDate.getTime() / 1000);
-        }
+      if (selectedTime !== '0') {
+        const now = new Date();
+        now.setMinutes(0,0,0);
+        now.setHours(now.getHours() + parseInt(selectedTime,10));
+        expectedEnd = Math.floor(now.getTime()/1000);
       }
 
       const nowTs = Math.floor(Date.now() / 1000);
-      const username = `${interaction.user.username}#${interaction.user.discriminator}`;
+      const username = interaction.member ? interaction.member.displayName : `${interaction.user.username}#${interaction.user.discriminator}`;
       await pool.query(
         'INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)',
         [interaction.user.id, username, nowTs, expectedEnd, note]
       );
       await interaction.deferUpdate();
 
-      await sendLog(`🟩 ${interaction.user.username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
+      await sendLog(`🟩 ${username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
     }
+
   } catch (err) {
     console.error('interaction error:', err);
     try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
   }
 });
 
-// --- auto-expire scheduled check every minute ---
+// --- auto-expire ---
 setInterval(async () => {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -269,12 +268,12 @@ setInterval(async () => {
   } catch (err) {
     console.error('auto-expire error:', err);
   }
-}, 60 * 1000);
+}, 60*1000);
 
 // --- start up ---
 (async () => {
   try {
-    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until you set it.');
+    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until設定するまで失敗します。');
     await initDb();
     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
     await client.login(DISCORD_TOKEN);
@@ -284,6 +283,7 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
 
 
 
@@ -539,6 +539,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
