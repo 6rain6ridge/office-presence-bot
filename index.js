@@ -157,7 +157,7 @@ client.on('interactionCreate', async (interaction) => {
         await pool.query('INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',[get.user_id, get.username, get.start, now, get.note]);
 
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
-        await interaction.reply({ content: `退出を記録しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。`, ephemeral: true });
+        // await interaction.reply({ content: `退出を記録しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。`, ephemeral: true });
         const panels = await pool.query('SELECT channel_id FROM panel');
         for (const p of panels.rows) await updatePanel(p.channel_id);
         return;
@@ -189,7 +189,7 @@ client.on('interactionCreate', async (interaction) => {
       const nowTs = Math.floor(Date.now() / 1000);
       const username = `${interaction.user.username}#${interaction.user.discriminator}`;
       await pool.query('INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)', [interaction.user.id, username, nowTs, expectedEnd, note]);
-      await interaction.reply({ content: `事務所利用を登録しました（開始: ${fmtTs(nowTs)}）。`, ephemeral: true });
+      // await interaction.reply({ content: `事務所利用を登録しました（開始: ${fmtTs(nowTs)}）。`, ephemeral: true });
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
     }
@@ -229,4 +229,5 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
 
