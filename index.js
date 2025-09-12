@@ -151,18 +151,21 @@ client.on('interactionCreate', async (interaction) => {
           'INSERT INTO panel(channel_id, message_id) VALUES($1,$2) ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id',
           [interaction.channelId, sent.id]
         );
-        await interaction.reply({ content: '事務所パネルを設置しました。', ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        await interaction.editReply('事務所パネルを設置しました。');
         return;
       }
       if (cmd === 'remove-office') {
         await pool.query('DELETE FROM panel WHERE channel_id = $1', [interaction.channelId]);
-        await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました（メッセージ自体は残ります）。', ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        await interaction.editReply('このチャンネルの事務所パネル情報を削除しました（メッセージ自体は残ります）。');
         return;
       }
     }
 
     // --- ボタン処理 ---
     if (interaction.isButton()) {
+      // 利用します → モーダル表示
       if (interaction.customId === 'office_join') {
         const modal = new ModalBuilder()
           .setCustomId('office_join_modal')
@@ -187,10 +190,11 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
+      // 退出します
       if (interaction.customId === 'office_leave') {
         const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
         if (!r.rows.length) {
-          await interaction.reply({ content: 'あなたは現在登録されていません。', ephemeral: true });
+          await interaction.deferUpdate(); // 非表示
           return;
         }
         const get = r.rows[0];
@@ -202,8 +206,7 @@ client.on('interactionCreate', async (interaction) => {
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
         await interaction.deferUpdate();
 
-        const displayName = interaction.member?.displayName || interaction.user.username;
-        await sendLog(`🟥 ${displayName} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` 📝: ${get.note}` : ''}`);
+        await sendLog(`🟥 ${interaction.member?.displayName || interaction.user.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` 📝: ${get.note}` : ''}`);
 
         const panels = await pool.query('SELECT channel_id FROM panel');
         for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -215,7 +218,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
       const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
       if (exists.rows.length) {
-        await interaction.reply({ content: '既に事務所利用中として登録されています。退出する場合は「退出します」を押してください。', ephemeral: true });
+        await interaction.deferUpdate(); // 非表示
         return;
       }
 
@@ -243,17 +246,18 @@ client.on('interactionCreate', async (interaction) => {
         'INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)',
         [interaction.user.id, username, nowTs, expectedEnd, note]
       );
-      await interaction.deferReply({ ephemeral: true });
-      await interaction.editReply('事務所利用を登録しました。');
 
       await sendLog(`🟩 ${username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）。${note ? ` 📝: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
+
+      await interaction.deferUpdate(); // 完全非表示
     }
+
   } catch (err) {
     console.error('interaction error:', err);
-    try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
+    try { if (interaction && !interaction.replied) await interaction.deferUpdate(); } catch {}
   }
 });
 
@@ -291,6 +295,7 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
 
 
 
@@ -590,6 +595,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
