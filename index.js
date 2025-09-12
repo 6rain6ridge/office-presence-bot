@@ -22,6 +22,28 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // 履歴ログ用チャン�
 
 if (!DISCORD_TOKEN) {
   console.error('DISCORD_TOKEN is required');
+  process.exit(1);// index.js
+require('dotenv').config();
+const express = require('express');
+const { Pool } = require('pg');
+const {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  InteractionType
+} = require('discord.js');
+
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // 履歴ログ用チャンネル
+
+if (!DISCORD_TOKEN) {
+  console.error('DISCORD_TOKEN is required');
   process.exit(1);
 }
 
@@ -157,31 +179,31 @@ client.on('interactionCreate', async (interaction) => {
 
     // --- ボタン処理 ---
     if (interaction.isButton()) {
-      // 利用します → 終了時刻選択セレクト表示
+      // 利用します → モーダル表示
       if (interaction.customId === 'office_join') {
-        // セレクト作成（午前 0:00～11:30、午後 12:00～23:30）
-        const amOptions = [];
-        const pmOptions = [];
-        for (let h = 0; h < 24; h++) {
-          for (let m = 0; m < 60; m += 30) {
-            const label = `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}`;
-            const value = label;
-            if (h < 12) amOptions.push({ label, value });
-            else pmOptions.push({ label, value });
-          }
-        }
-        const rows = [];
-        if (amOptions.length > 0) rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
-          .setCustomId('endTime_select_am')
-          .setPlaceholder('終了時刻（午前）')
-          .addOptions(amOptions)
-        ));
-        if (pmOptions.length > 0) rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
-          .setCustomId('endTime_select_pm')
-          .setPlaceholder('終了時刻（午後）')
-          .addOptions(pmOptions)
-        ));
-        await interaction.reply({ content: '終了予定時刻を選択してください（任意の場合はスキップ可能です）', components: rows, ephemeral: true });
+        // モーダル作成
+        const modal = new ModalBuilder()
+          .setCustomId('office_join_modal')
+          .setTitle('事務所利用登録');
+
+        // 終了予定時刻（TextInput で 30分刻みを選択する形）
+        const timeInput = new TextInputBuilder()
+          .setCustomId('endTime')
+          .setLabel('終了予定時刻（例: 09:00, 13:30）')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false);
+
+        // 用途メモ（任意）
+        const noteInput = new TextInputBuilder()
+          .setCustomId('note')
+          .setLabel('用途やメモ（任意）')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(timeInput));
+        modal.addComponents(new ActionRowBuilder().addComponents(noteInput));
+
+        await interaction.showModal(modal);
         return;
       }
 
@@ -201,7 +223,6 @@ client.on('interactionCreate', async (interaction) => {
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
         await interaction.deferUpdate();
 
-        // 履歴チャンネルに送信
         await sendLog(`🟥 ${interaction.user.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
 
         const panels = await pool.query('SELECT channel_id FROM panel');
@@ -210,37 +231,18 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // --- セレクトメニュー選択（終了時刻選択後にメモモーダル表示） ---
-    if (interaction.isStringSelectMenu()) {
-      if (interaction.customId.startsWith('endTime_select_')) {
-        const selectedTime = interaction.values[0]; // HH:MM
-        // メモ入力モーダル
-        const modal = new ModalBuilder()
-          .setCustomId(`office_join_modal|${selectedTime}`)
-          .setTitle('事務所利用登録');
-        const noteInput = new TextInputBuilder()
-          .setCustomId('note')
-          .setLabel('用途やメモ（任意）')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false);
-        modal.addComponents(new ActionRowBuilder().addComponents(noteInput));
-        await interaction.showModal(modal);
-        return;
-      }
-    }
-
     // --- モーダル送信 ---
-    if (interaction.type === InteractionType.ModalSubmit && interaction.customId.startsWith('office_join_modal')) {
+    if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
       const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
       if (exists.rows.length) {
         await interaction.reply({ content: '既に事務所利用中として登録されています。退出する場合は「退出します」を押してください。', ephemeral: true });
         return;
       }
 
-      // 終了時刻を customId から取得
-      const endTimeText = interaction.customId.split('|')[1] || '';
+      const endTimeText = interaction.fields.getTextInputValue('endTime') || '';
       const note = interaction.fields.getTextInputValue('note') || '';
       let expectedEnd = null;
+
       if (endTimeText) {
         const m = endTimeText.match(/^(\d{1,2}):(\d{2})$/);
         if (m) {
@@ -261,7 +263,6 @@ client.on('interactionCreate', async (interaction) => {
       );
       await interaction.deferUpdate();
 
-      // 履歴チャンネルに送信
       await sendLog(`🟩 ${interaction.user.username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
@@ -285,7 +286,6 @@ setInterval(async () => {
       );
       await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
 
-      // 履歴チャンネルに送信
       await sendLog(`⏰ ${r.username} の利用時間が終了しました（開始: ${fmtTs(r.start)} → 自動終了: ${fmtTs(r.expected_end)}）。${r.note ? ` メモ: ${r.note}` : ''}`);
     }
     const panels = await pool.query('SELECT channel_id FROM panel');
@@ -562,6 +562,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
