@@ -246,7 +246,7 @@ client.on('interactionCreate', async (interaction) => {
       );
       await interaction.deferUpdate();
 
-      await sendLog(`🟩 ${username} が利用開始（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）${note ? ` ／メモ: ${note}` : ''}`);
+      await sendLog(`🟩 ${username} が利用開始（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）${note ? ` 📝: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -550,6 +550,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
