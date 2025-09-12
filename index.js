@@ -25,6 +25,14 @@ if (!DISCORD_TOKEN) {
 
 // --- Express ---
 const app = express();
+app.use(express.json());
+
+// Ping 用エンドポイント（Discord Interaction）
+// ここは Render 側で必須、署名検証は省略しています
+app.post('/interactions', (req, res) => {
+  res.json({ type: 1 }); // PONG
+});
+
 app.get('/', (req, res) => res.send('OK - office tracker'));
 const PORT = process.env.PORT || 10000;
 
@@ -138,10 +146,10 @@ async function sendLog(message) {
   }
 }
 
-// --- Interaction handling ---
+// --- Discord Interaction handling ---
 client.on('interactionCreate', async (interaction) => {
   try {
-    // --- スラッシュコマンド ---
+    // スラッシュコマンド
     if (interaction.isChatInputCommand()) {
       const cmd = interaction.commandName;
       if (cmd === 'setup-office') {
@@ -163,7 +171,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // --- ボタン処理 ---
+    // ボタン処理
     if (interaction.isButton()) {
       if (interaction.customId === 'office_join') {
         const modal = new ModalBuilder()
@@ -212,14 +220,8 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // --- モーダル送信 ---
+    // モーダル送信
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
-      const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
-      if (exists.rows.length) {
-        await interaction.deferUpdate();
-        return;
-      }
-
       const endTimeText = interaction.fields.getTextInputValue('endTime') || '';
       const note = interaction.fields.getTextInputValue('note') || '';
       let expectedEnd = null;
@@ -230,24 +232,18 @@ client.on('interactionCreate', async (interaction) => {
           const hh = parseInt(m[1], 10);
           const mm = parseInt(m[2], 10);
 
-          // JST基準
+          // JST 時間処理
           const now = new Date();
-          const nowJST = new Date(now.getTime() + 9 * 3600 * 1000);
-
+          const jstNow = new Date(now.getTime() + 9 * 3600 * 1000);
           const endJST = new Date(Date.UTC(
-            nowJST.getUTCFullYear(),
-            nowJST.getUTCMonth(),
-            nowJST.getUTCDate(),
+            jstNow.getUTCFullYear(),
+            jstNow.getUTCMonth(),
+            jstNow.getUTCDate(),
             hh,
             mm,
-            0,
             0
           ));
-
-          if (endJST.getTime() <= nowJST.getTime()) {
-            endJST.setUTCDate(endJST.getUTCDate() + 1);
-          }
-
+          if (endJST.getTime() <= jstNow.getTime()) endJST.setUTCDate(endJST.getUTCDate() + 1);
           expectedEnd = Math.floor(endJST.getTime() / 1000 - 9 * 3600);
         }
       }
@@ -274,7 +270,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// --- auto-expire scheduled check every minute ---
+// --- 自動終了チェック（1分ごと） ---
 setInterval(async () => {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -295,10 +291,9 @@ setInterval(async () => {
   }
 }, 60 * 1000);
 
-// --- start up ---
+// --- Start up ---
 (async () => {
   try {
-    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until you set it.');
     await initDb();
     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
     await client.login(DISCORD_TOKEN);
@@ -308,10 +303,6 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
-
-
-
-
 
 
 
@@ -346,14 +337,16 @@ setInterval(async () => {
 // app.get('/', (req, res) => res.send('OK - office tracker'));
 // const PORT = process.env.PORT || 10000;
 
-// // --- Postgres pool ---
+// // --- Postgres ---
 // const poolConfig = {
 //   connectionString: process.env.DATABASE_URL || null,
 //   max: process.env.PG_MAX ? Number(process.env.PG_MAX) : 5,
 //   idleTimeoutMillis: 30000,
 //   connectionTimeoutMillis: 20000
 // };
-// if (process.env.DATABASE_SSL === 'true') poolConfig.ssl = { rejectUnauthorized: false };
+// if (process.env.DATABASE_SSL === 'true') {
+//   poolConfig.ssl = { rejectUnauthorized: false };
+// }
 // const pool = new Pool(poolConfig);
 
 // // --- Discord client ---
@@ -393,36 +386,33 @@ setInterval(async () => {
 // function fmtTs(ts) {
 //   if (!ts) return '未設定';
 //   const d = new Date(Number(ts) * 1000);
-//   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000); // UTC→JST
+//   const jst = new Date(d.getTime() + 9 * 3600 * 1000); // JST
 //   return `${jst.getFullYear()}/${(jst.getMonth()+1).toString().padStart(2,'0')}/${jst.getDate().toString().padStart(2,'0')} ${jst.getHours().toString().padStart(2,'0')}:${jst.getMinutes().toString().padStart(2,'0')}`;
 // }
 
 // function fmtHHMM(ts) {
 //   if (!ts) return '未設定';
 //   const d = new Date(Number(ts) * 1000);
-//   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000); // UTC→JST
+//   const jst = new Date(d.getTime() + 9 * 3600 * 1000);
 //   return `${jst.getHours().toString().padStart(2,'0')}:${jst.getMinutes().toString().padStart(2,'0')}`;
 // }
 
 // function panelComponents() {
-//   return [new ActionRowBuilder()
-//     .addComponents(
-//       new ButtonBuilder().setCustomId('office_join').setLabel('利用します').setStyle(ButtonStyle.Success),
-//       new ButtonBuilder().setCustomId('office_leave').setLabel('退出します').setStyle(ButtonStyle.Danger)
-//     )
-//   ];
+//   const row = new ActionRowBuilder().addComponents(
+//     new ButtonBuilder().setCustomId('office_join').setLabel('利用します').setStyle(ButtonStyle.Success),
+//     new ButtonBuilder().setCustomId('office_leave').setLabel('退出します').setStyle(ButtonStyle.Danger)
+//   );
+//   return [row];
 // }
 
 // async function buildPanelEmbed(channelId) {
 //   const res = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users ORDER BY start');
 //   const rows = res.rows || [];
 //   let desc = '';
-//   if (!rows.length) desc = '現在、事務所にいる人はいません。';
+//   if (rows.length === 0) desc = '現在、事務所にいる人はいません。';
 //   else {
 //     for (const r of rows) {
-//       const startJST = fmtTs(r.start);
-//       const endHHMM = r.expected_end ? fmtHHMM(r.expected_end) : '未設定';
-//       desc += `🟢 ${r.username}  開始: ${startJST} / 終了予定: ${endHHMM}${r.note ? ` 📝${r.note}` : ''}\n`;
+//       desc += `🟢 ${r.username} — 開始: ${fmtTs(r.start)} / 終了予定: ${r.expected_end ? fmtHHMM(r.expected_end) : '未設定'} ${r.note ? `📝${r.note}` : ''}\n`;
 //     }
 //   }
 //   return new EmbedBuilder()
@@ -462,19 +452,22 @@ setInterval(async () => {
 //   try {
 //     // --- スラッシュコマンド ---
 //     if (interaction.isChatInputCommand()) {
-//       if (interaction.commandName === 'setup-office') {
+//       const cmd = interaction.commandName;
+//       if (cmd === 'setup-office') {
 //         const embed = await buildPanelEmbed(interaction.channelId);
 //         const sent = await interaction.channel.send({ embeds: [embed], components: panelComponents() });
 //         await pool.query(
 //           'INSERT INTO panel(channel_id, message_id) VALUES($1,$2) ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id',
 //           [interaction.channelId, sent.id]
 //         );
-//         await interaction.reply({ content: '事務所パネルを設置しました。', ephemeral: true });
+//         await interaction.deferReply({ ephemeral: true });
+//         await interaction.editReply('事務所パネルを設置しました。');
 //         return;
 //       }
-//       if (interaction.commandName === 'remove-office') {
+//       if (cmd === 'remove-office') {
 //         await pool.query('DELETE FROM panel WHERE channel_id = $1', [interaction.channelId]);
-//         await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました。', ephemeral: true });
+//         await interaction.deferReply({ ephemeral: true });
+//         await interaction.editReply('このチャンネルの事務所パネル情報を削除しました（メッセージ自体は残ります）。');
 //         return;
 //       }
 //     }
@@ -508,12 +501,11 @@ setInterval(async () => {
 //       if (interaction.customId === 'office_leave') {
 //         const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
 //         if (!r.rows.length) {
-//           await interaction.reply({ content: '現在登録されていません。', ephemeral: true });
+//           await interaction.deferUpdate();
 //           return;
 //         }
 //         const get = r.rows[0];
 //         const now = Math.floor(Date.now() / 1000);
-
 //         await pool.query(
 //           'INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',
 //           [get.user_id, get.username, get.start, now, get.note]
@@ -521,8 +513,7 @@ setInterval(async () => {
 //         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
 //         await interaction.deferUpdate();
 
-//         const displayName = interaction.member?.displayName || interaction.user.username;
-//         await sendLog(`🟥 ${displayName} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）${get.note ? ` 📝: ${get.note}` : ''}`);
+//         await sendLog(`🟥 ${interaction.member?.displayName || interaction.user.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` 📝: ${get.note}` : ''}`);
 
 //         const panels = await pool.query('SELECT channel_id FROM panel');
 //         for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -534,7 +525,7 @@ setInterval(async () => {
 //     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
 //       const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
 //       if (exists.rows.length) {
-//         await interaction.reply({ content: '既に登録済みです。退出する場合は「退出します」を押してください。', ephemeral: true });
+//         await interaction.deferUpdate();
 //         return;
 //       }
 
@@ -545,13 +536,28 @@ setInterval(async () => {
 //       if (endTimeText) {
 //         const m = endTimeText.match(/^(\d{1,2}):(\d{2})$/);
 //         if (m) {
-//           const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+//           const hh = parseInt(m[1], 10);
+//           const mm = parseInt(m[2], 10);
+
+//           // JST基準
 //           const now = new Date();
-//           const endDate = new Date(now);
-//           // JSTに変換済み
-//           endDate.setHours(hh - 9, mm, 0, 0);
-//           if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
-//           expectedEnd = Math.floor(endDate.getTime() / 1000);
+//           const nowJST = new Date(now.getTime() + 9 * 3600 * 1000);
+
+//           const endJST = new Date(Date.UTC(
+//             nowJST.getUTCFullYear(),
+//             nowJST.getUTCMonth(),
+//             nowJST.getUTCDate(),
+//             hh,
+//             mm,
+//             0,
+//             0
+//           ));
+
+//           if (endJST.getTime() <= nowJST.getTime()) {
+//             endJST.setUTCDate(endJST.getUTCDate() + 1);
+//           }
+
+//           expectedEnd = Math.floor(endJST.getTime() / 1000 - 9 * 3600);
 //         }
 //       }
 
@@ -562,20 +568,22 @@ setInterval(async () => {
 //         'INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)',
 //         [interaction.user.id, username, nowTs, expectedEnd, note]
 //       );
-//       await interaction.deferUpdate();
 
-//       await sendLog(`🟩 ${username} が利用開始（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）${note ? ` 📝: ${note}` : ''}`);
+//       await sendLog(`🟩 ${username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）。${note ? ` 📝: ${note}` : ''}`);
 
 //       const panels = await pool.query('SELECT channel_id FROM panel');
 //       for (const p of panels.rows) await updatePanel(p.channel_id);
+
+//       await interaction.deferUpdate();
 //     }
+
 //   } catch (err) {
 //     console.error('interaction error:', err);
-//     try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
+//     try { if (interaction && !interaction.replied) await interaction.deferUpdate(); } catch {}
 //   }
 // });
 
-// // --- auto-expire ---
+// // --- auto-expire scheduled check every minute ---
 // setInterval(async () => {
 //   try {
 //     const now = Math.floor(Date.now() / 1000);
@@ -587,7 +595,7 @@ setInterval(async () => {
 //       );
 //       await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
 
-//       await sendLog(`⏰ ${r.username} 利用終了（開始: ${fmtTs(r.start)} → 自動終了: ${fmtHHMM(r.expected_end)}）${r.note ? ` 📝: ${r.note}` : ''}`);
+//       await sendLog(`⏰ ${r.username} の利用時間が終了しました（開始: ${fmtTs(r.start)} → 自動終了: ${fmtHHMM(r.expected_end)}）。${r.note ? ` 📝: ${r.note}` : ''}`);
 //     }
 //     const panels = await pool.query('SELECT channel_id FROM panel');
 //     for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -599,7 +607,7 @@ setInterval(async () => {
 // // --- start up ---
 // (async () => {
 //   try {
-//     if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set.');
+//     if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until you set it.');
 //     await initDb();
 //     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
 //     await client.login(DISCORD_TOKEN);
@@ -609,7 +617,6 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
-
 
 
 
