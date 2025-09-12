@@ -169,6 +169,8 @@ client.on('interactionCreate', async (interaction) => {
             { label: '5H', value: '5' },
             { label: '6H', value: '6' },
             { label: '7H', value: '7' },
+            { label: '8H', value: '8' },
+            { label: '9H', value: '9' },
             { label: '10H', value: '10' },
             { label: '未定', value: '0' }
           ]);
@@ -539,6 +541,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
