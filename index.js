@@ -79,6 +79,13 @@ function fmtTs(ts) {
   return `${jst.getFullYear()}/${(jst.getMonth()+1).toString().padStart(2,'0')}/${jst.getDate().toString().padStart(2,'0')} ${jst.getHours().toString().padStart(2,'0')}:${jst.getMinutes().toString().padStart(2,'0')}`;
 }
 
+function fmtHHMM(ts) {
+  if (!ts) return '未設定';
+  const d = new Date(Number(ts) * 1000);
+  const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000); // UTC→JST
+  return `${jst.getHours().toString().padStart(2,'0')}:${jst.getMinutes().toString().padStart(2,'0')}`;
+}
+
 function panelComponents() {
   return [new ActionRowBuilder()
     .addComponents(
@@ -96,8 +103,8 @@ async function buildPanelEmbed(channelId) {
   else {
     for (const r of rows) {
       const startJST = fmtTs(r.start);
-      const endJST = r.expected_end ? fmtTs(r.expected_end) : '未設定';
-      desc += `🟢 ${r.username} — 開始: ${startJST} / 終了予定: ${endJST}${r.note ? ` ／${r.note}` : ''}\n`;
+      const endHHMM = r.expected_end ? fmtHHMM(r.expected_end) : '未設定';
+      desc += `🟢 ${r.username}\n  開始: ${startJST} / 終了予定: ${endHHMM}${r.note ? ` ／${r.note}` : ''}\n`;
     }
   }
   return new EmbedBuilder()
@@ -223,9 +230,8 @@ client.on('interactionCreate', async (interaction) => {
           const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
           const now = new Date();
           const endDate = new Date(now);
-          endDate.setHours(hh, mm, 0, 0);
-          // JST補正
-          endDate.setTime(endDate.getTime() - now.getTimezoneOffset()*60*1000 + 9*60*60*1000);
+          // JSTに変換済み
+          endDate.setHours(hh - 9, mm, 0, 0);
           if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
           expectedEnd = Math.floor(endDate.getTime() / 1000);
         }
@@ -240,51 +246,13 @@ client.on('interactionCreate', async (interaction) => {
       );
       await interaction.deferUpdate();
 
-      await sendLog(`🟩 ${username} が利用開始（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）${note ? ` ／メモ: ${note}` : ''}`);
+      await sendLog(`🟩 ${username} が利用開始（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）${note ? ` ／メモ: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
     }
-  } catch (err) {
-    console.error('interaction error:', err);
-    try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
-  }
-});
+  } catch (err
 
-// --- auto-expire scheduled check ---
-setInterval(async () => {
-  try {
-    const now = Math.floor(Date.now() / 1000);
-    const rr = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users WHERE expected_end IS NOT NULL AND expected_end <= $1', [now]);
-    for (const r of rr.rows) {
-      await pool.query(
-        'INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',
-        [r.user_id, r.username, r.start, r.expected_end, r.note]
-      );
-      await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
-
-      await sendLog(`⏰ ${r.username} の利用時間終了（開始: ${fmtTs(r.start)} → 自動終了: ${fmtTs(r.expected_end)}）${r.note ? ` ／メモ: ${r.note}` : ''}`);
-    }
-    const panels = await pool.query('SELECT channel_id FROM panel');
-    for (const p of panels.rows) await updatePanel(p.channel_id);
-  } catch (err) {
-    console.error('auto-expire error:', err);
-  }
-}, 60 * 1000);
-
-// --- start up ---
-(async () => {
-  try {
-    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail.');
-    await initDb();
-    app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
-    await client.login(DISCORD_TOKEN);
-    console.log('Discord client logged in');
-  } catch (err) {
-    console.error('startup error', err);
-    process.exit(1);
-  }
-})();
 
 
 
@@ -544,6 +512,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
