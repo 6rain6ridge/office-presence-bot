@@ -165,7 +165,6 @@ client.on('interactionCreate', async (interaction) => {
 
     // --- ボタン処理 ---
     if (interaction.isButton()) {
-      // 利用します → モーダル表示
       if (interaction.customId === 'office_join') {
         const modal = new ModalBuilder()
           .setCustomId('office_join_modal')
@@ -190,11 +189,10 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // 退出します
       if (interaction.customId === 'office_leave') {
         const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
         if (!r.rows.length) {
-          await interaction.deferUpdate(); // 非表示
+          await interaction.deferUpdate();
           return;
         }
         const get = r.rows[0];
@@ -218,7 +216,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
       const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
       if (exists.rows.length) {
-        await interaction.deferUpdate(); // 非表示
+        await interaction.deferUpdate();
         return;
       }
 
@@ -229,13 +227,28 @@ client.on('interactionCreate', async (interaction) => {
       if (endTimeText) {
         const m = endTimeText.match(/^(\d{1,2}):(\d{2})$/);
         if (m) {
-          const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+          const hh = parseInt(m[1], 10);
+          const mm = parseInt(m[2], 10);
+
+          // JST基準
           const now = new Date();
-          const endDate = new Date();
-          endDate.setFullYear(now.getFullYear(), now.getMonth(), now.getDate());
-          endDate.setHours(hh, mm, 0, 0);
-          if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
-          expectedEnd = Math.floor(endDate.getTime() / 1000);
+          const nowJST = new Date(now.getTime() + 9 * 3600 * 1000);
+
+          const endJST = new Date(Date.UTC(
+            nowJST.getUTCFullYear(),
+            nowJST.getUTCMonth(),
+            nowJST.getUTCDate(),
+            hh,
+            mm,
+            0,
+            0
+          ));
+
+          if (endJST.getTime() <= nowJST.getTime()) {
+            endJST.setUTCDate(endJST.getUTCDate() + 1);
+          }
+
+          expectedEnd = Math.floor(endJST.getTime() / 1000 - 9 * 3600);
         }
       }
 
@@ -252,7 +265,7 @@ client.on('interactionCreate', async (interaction) => {
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
 
-      await interaction.deferUpdate(); // 完全非表示
+      await interaction.deferUpdate();
     }
 
   } catch (err) {
@@ -295,6 +308,7 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
 
 
 
@@ -595,6 +609,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
