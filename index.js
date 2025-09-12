@@ -35,7 +35,9 @@ const poolConfig = {
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 20000
 };
-if (process.env.DATABASE_SSL === 'true') poolConfig.ssl = { rejectUnauthorized: false };
+if (process.env.DATABASE_SSL === 'true') {
+  poolConfig.ssl = { rejectUnauthorized: false };
+}
 const pool = new Pool(poolConfig);
 
 // --- Discord client ---
@@ -79,10 +81,11 @@ function fmtTs(ts) {
 }
 
 function panelComponents() {
-  return [new ActionRowBuilder().addComponents(
+  const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('office_join').setLabel('利用します').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('office_leave').setLabel('退出します').setStyle(ButtonStyle.Danger)
-  )];
+  );
+  return [row];
 }
 
 async function buildPanelEmbed(channelId) {
@@ -152,18 +155,17 @@ client.on('interactionCreate', async (interaction) => {
 
     // --- ボタン処理 ---
     if (interaction.isButton()) {
-      // 利用します → モーダル
+      // 利用します → モーダル表示
       if (interaction.customId === 'office_join') {
         const modal = new ModalBuilder()
           .setCustomId('office_join_modal')
           .setTitle('事務所利用登録');
 
-        const timeInput = new TextInputBuilder()
-          .setCustomId('duration')
-          .setLabel('利用時間（必須）')
+        const endTimeInput = new TextInputBuilder()
+          .setCustomId('endTime')
+          .setLabel('終了予定時刻（例: 09:00, 13:30）')
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder('1H / 2H / 3H / 5H / 6H / 7H / 10H / 未定')
-          .setRequired(true);
+          .setRequired(false);
 
         const noteInput = new TextInputBuilder()
           .setCustomId('note')
@@ -171,10 +173,8 @@ client.on('interactionCreate', async (interaction) => {
           .setStyle(TextInputStyle.Short)
           .setRequired(false);
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(timeInput),
-          new ActionRowBuilder().addComponents(noteInput)
-        );
+        modal.addComponents(new ActionRowBuilder().addComponents(endTimeInput));
+        modal.addComponents(new ActionRowBuilder().addComponents(noteInput));
 
         await interaction.showModal(modal);
         return;
@@ -196,7 +196,8 @@ client.on('interactionCreate', async (interaction) => {
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
         await interaction.deferUpdate();
 
-        await sendLog(`🟥 ${get.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
+        const displayName = interaction.member?.displayName || interaction.user.username;
+        await sendLog(`🟥 ${displayName} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
 
         const panels = await pool.query('SELECT channel_id FROM panel');
         for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -212,39 +213,43 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const duration = interaction.fields.getTextInputValue('duration').trim();
+      const endTimeText = interaction.fields.getTextInputValue('endTime') || '';
       const note = interaction.fields.getTextInputValue('note') || '';
-
-      const now = new Date();
       let expectedEnd = null;
 
-      if (duration !== '未定') {
-        const hours = parseInt(duration.replace('H',''), 10);
-        if (!isNaN(hours)) expectedEnd = Math.floor(now.getTime()/1000) + hours*3600;
+      if (endTimeText) {
+        const m = endTimeText.match(/^(\d{1,2}):(\d{2})$/);
+        if (m) {
+          const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+          const now = new Date();
+          const endDate = new Date(now);
+          endDate.setHours(hh, mm, 0, 0);
+          if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
+          expectedEnd = Math.floor(endDate.getTime() / 1000);
+        }
       }
 
+      const nowTs = Math.floor(Date.now() / 1000);
       const username = interaction.member?.displayName || interaction.user.username;
-      const nowTs = Math.floor(now.getTime()/1000);
 
       await pool.query(
         'INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)',
         [interaction.user.id, username, nowTs, expectedEnd, note]
       );
+      await interaction.deferUpdate();
 
-      await interaction.reply({ content: `🟩 ${username} が利用を開始しました。${expectedEnd ? `終了予定: ${fmtTs(expectedEnd)}` : ''} ${note ? `メモ: ${note}` : ''}`, ephemeral: true });
       await sendLog(`🟩 ${username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
     }
-
   } catch (err) {
     console.error('interaction error:', err);
     try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
   }
 });
 
-// --- auto-expire check every minute ---
+// --- auto-expire scheduled check every minute ---
 setInterval(async () => {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -268,7 +273,7 @@ setInterval(async () => {
 // --- start up ---
 (async () => {
   try {
-    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until設定してください。');
+    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until you set it.');
     await initDb();
     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
     await client.login(DISCORD_TOKEN);
@@ -278,6 +283,7 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
 
 
 
@@ -535,6 +541,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
