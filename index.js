@@ -16,14 +16,14 @@ const {
 } = require('discord.js');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // 履歴ログ用チャンネル
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 
 if (!DISCORD_TOKEN) {
   console.error('DISCORD_TOKEN is required');
   process.exit(1);
 }
 
-// --- Express for Render health check ---
+// --- Express ---
 const app = express();
 app.get('/', (req, res) => res.send('OK - office tracker'));
 const PORT = process.env.PORT || 10000;
@@ -35,9 +35,7 @@ const poolConfig = {
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 20000
 };
-if (process.env.DATABASE_SSL === 'true') {
-  poolConfig.ssl = { rejectUnauthorized: false };
-}
+if (process.env.DATABASE_SSL === 'true') poolConfig.ssl = { rejectUnauthorized: false };
 const pool = new Pool(poolConfig);
 
 // --- Discord client ---
@@ -77,25 +75,29 @@ async function initDb() {
 function fmtTs(ts) {
   if (!ts) return '未設定';
   const d = new Date(Number(ts) * 1000);
-  return `${d.getFullYear()}/${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+  const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000); // UTC→JST
+  return `${jst.getFullYear()}/${(jst.getMonth()+1).toString().padStart(2,'0')}/${jst.getDate().toString().padStart(2,'0')} ${jst.getHours().toString().padStart(2,'0')}:${jst.getMinutes().toString().padStart(2,'0')}`;
 }
 
 function panelComponents() {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('office_join').setLabel('利用します').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('office_leave').setLabel('退出します').setStyle(ButtonStyle.Danger)
-  );
-  return [row];
+  return [new ActionRowBuilder()
+    .addComponents(
+      new ButtonBuilder().setCustomId('office_join').setLabel('利用します').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('office_leave').setLabel('退出します').setStyle(ButtonStyle.Danger)
+    )
+  ];
 }
 
 async function buildPanelEmbed(channelId) {
   const res = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users ORDER BY start');
   const rows = res.rows || [];
   let desc = '';
-  if (rows.length === 0) desc = '現在、事務所にいる人はいません。';
+  if (!rows.length) desc = '現在、事務所にいる人はいません。';
   else {
     for (const r of rows) {
-      desc += `• ${r.username} — 開始: ${fmtTs(r.start)} / 終了予定: ${r.expected_end ? fmtTs(r.expected_end) : '未設定'} ${r.note ? `／${r.note}` : ''}\n`;
+      const startJST = fmtTs(r.start);
+      const endJST = r.expected_end ? fmtTs(r.expected_end) : '未設定';
+      desc += `🟢 ${r.username} — 開始: ${startJST} / 終了予定: ${endJST}${r.note ? ` ／${r.note}` : ''}\n`;
     }
   }
   return new EmbedBuilder()
@@ -135,8 +137,7 @@ client.on('interactionCreate', async (interaction) => {
   try {
     // --- スラッシュコマンド ---
     if (interaction.isChatInputCommand()) {
-      const cmd = interaction.commandName;
-      if (cmd === 'setup-office') {
+      if (interaction.commandName === 'setup-office') {
         const embed = await buildPanelEmbed(interaction.channelId);
         const sent = await interaction.channel.send({ embeds: [embed], components: panelComponents() });
         await pool.query(
@@ -146,16 +147,15 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({ content: '事務所パネルを設置しました。', ephemeral: true });
         return;
       }
-      if (cmd === 'remove-office') {
+      if (interaction.commandName === 'remove-office') {
         await pool.query('DELETE FROM panel WHERE channel_id = $1', [interaction.channelId]);
-        await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました（メッセージ自体は残ります）。', ephemeral: true });
+        await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました。', ephemeral: true });
         return;
       }
     }
 
     // --- ボタン処理 ---
     if (interaction.isButton()) {
-      // 利用します → モーダル表示
       if (interaction.customId === 'office_join') {
         const modal = new ModalBuilder()
           .setCustomId('office_join_modal')
@@ -180,15 +180,15 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // 退出ボタン
       if (interaction.customId === 'office_leave') {
         const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
         if (!r.rows.length) {
-          await interaction.reply({ content: 'あなたは現在登録されていません。', ephemeral: true });
+          await interaction.reply({ content: '現在登録されていません。', ephemeral: true });
           return;
         }
         const get = r.rows[0];
         const now = Math.floor(Date.now() / 1000);
+
         await pool.query(
           'INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',
           [get.user_id, get.username, get.start, now, get.note]
@@ -197,7 +197,7 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferUpdate();
 
         const displayName = interaction.member?.displayName || interaction.user.username;
-        await sendLog(`🟥 ${displayName} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
+        await sendLog(`🟥 ${displayName} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）${get.note ? ` ／メモ: ${get.note}` : ''}`);
 
         const panels = await pool.query('SELECT channel_id FROM panel');
         for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -209,7 +209,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
       const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
       if (exists.rows.length) {
-        await interaction.reply({ content: '既に事務所利用中として登録されています。退出する場合は「退出します」を押してください。', ephemeral: true });
+        await interaction.reply({ content: '既に登録済みです。退出する場合は「退出します」を押してください。', ephemeral: true });
         return;
       }
 
@@ -224,6 +224,8 @@ client.on('interactionCreate', async (interaction) => {
           const now = new Date();
           const endDate = new Date(now);
           endDate.setHours(hh, mm, 0, 0);
+          // JST補正
+          endDate.setTime(endDate.getTime() - now.getTimezoneOffset()*60*1000 + 9*60*60*1000);
           if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
           expectedEnd = Math.floor(endDate.getTime() / 1000);
         }
@@ -238,7 +240,7 @@ client.on('interactionCreate', async (interaction) => {
       );
       await interaction.deferUpdate();
 
-      await sendLog(`🟩 ${username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
+      await sendLog(`🟩 ${username} が利用開始（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）${note ? ` ／メモ: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -249,7 +251,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// --- auto-expire scheduled check every minute ---
+// --- auto-expire scheduled check ---
 setInterval(async () => {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -261,7 +263,7 @@ setInterval(async () => {
       );
       await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
 
-      await sendLog(`⏰ ${r.username} の利用時間が終了しました（開始: ${fmtTs(r.start)} → 自動終了: ${fmtTs(r.expected_end)}）。${r.note ? ` メモ: ${r.note}` : ''}`);
+      await sendLog(`⏰ ${r.username} の利用時間終了（開始: ${fmtTs(r.start)} → 自動終了: ${fmtTs(r.expected_end)}）${r.note ? ` ／メモ: ${r.note}` : ''}`);
     }
     const panels = await pool.query('SELECT channel_id FROM panel');
     for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -273,7 +275,7 @@ setInterval(async () => {
 // --- start up ---
 (async () => {
   try {
-    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until you set it.');
+    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail.');
     await initDb();
     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
     await client.login(DISCORD_TOKEN);
@@ -283,6 +285,7 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
 
 
 
@@ -541,6 +544,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
