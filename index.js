@@ -12,7 +12,6 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  StringSelectMenuBuilder,
   InteractionType
 } = require('discord.js');
 
@@ -24,21 +23,19 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-// --- Express for health check ---
+// --- Express for Render health check ---
 const app = express();
 app.get('/', (req, res) => res.send('OK - office tracker'));
 const PORT = process.env.PORT || 10000;
 
-// --- Postgres (Neon) pool ---
+// --- Postgres pool ---
 const poolConfig = {
   connectionString: process.env.DATABASE_URL || null,
   max: process.env.PG_MAX ? Number(process.env.PG_MAX) : 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 20000
 };
-if (process.env.DATABASE_SSL === 'true') {
-  poolConfig.ssl = { rejectUnauthorized: false };
-}
+if (process.env.DATABASE_SSL === 'true') poolConfig.ssl = { rejectUnauthorized: false };
 const pool = new Pool(poolConfig);
 
 // --- Discord client ---
@@ -155,25 +152,18 @@ client.on('interactionCreate', async (interaction) => {
 
     // --- ボタン処理 ---
     if (interaction.isButton()) {
+      // 利用します → モーダル
       if (interaction.customId === 'office_join') {
-        // 利用時間選択モーダル作成
-        const modal = new ModalBuilder().setCustomId('office_join_modal').setTitle('事務所利用登録');
+        const modal = new ModalBuilder()
+          .setCustomId('office_join_modal')
+          .setTitle('事務所利用登録');
 
-        const timeSelect = new StringSelectMenuBuilder()
-          .setCustomId('useTime')
-          .setPlaceholder('利用時間を選択してください')
-          .addOptions([
-            { label: '1H', value: '1' },
-            { label: '2H', value: '2' },
-            { label: '3H', value: '3' },
-            { label: '5H', value: '5' },
-            { label: '6H', value: '6' },
-            { label: '7H', value: '7' },
-            { label: '8H', value: '8' },
-            { label: '9H', value: '9' },
-            { label: '10H', value: '10' },
-            { label: '未定', value: '0' }
-          ]);
+        const timeInput = new TextInputBuilder()
+          .setCustomId('duration')
+          .setLabel('利用時間（必須）')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('1H / 2H / 3H / 5H / 6H / 7H / 10H / 未定')
+          .setRequired(true);
 
         const noteInput = new TextInputBuilder()
           .setCustomId('note')
@@ -182,7 +172,7 @@ client.on('interactionCreate', async (interaction) => {
           .setRequired(false);
 
         modal.addComponents(
-          new ActionRowBuilder().addComponents(timeSelect),
+          new ActionRowBuilder().addComponents(timeInput),
           new ActionRowBuilder().addComponents(noteInput)
         );
 
@@ -190,6 +180,7 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
+      // 退出ボタン
       if (interaction.customId === 'office_leave') {
         const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
         if (!r.rows.length) {
@@ -221,24 +212,26 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const selectedTime = interaction.fields.getSelectMenuValues('useTime')[0] || '0';
+      const duration = interaction.fields.getTextInputValue('duration').trim();
       const note = interaction.fields.getTextInputValue('note') || '';
+
+      const now = new Date();
       let expectedEnd = null;
-      if (selectedTime !== '0') {
-        const now = new Date();
-        now.setMinutes(0,0,0);
-        now.setHours(now.getHours() + parseInt(selectedTime,10));
-        expectedEnd = Math.floor(now.getTime()/1000);
+
+      if (duration !== '未定') {
+        const hours = parseInt(duration.replace('H',''), 10);
+        if (!isNaN(hours)) expectedEnd = Math.floor(now.getTime()/1000) + hours*3600;
       }
 
-      const nowTs = Math.floor(Date.now() / 1000);
-      const username = interaction.member ? interaction.member.displayName : `${interaction.user.username}#${interaction.user.discriminator}`;
+      const username = interaction.member?.displayName || interaction.user.username;
+      const nowTs = Math.floor(now.getTime()/1000);
+
       await pool.query(
         'INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)',
         [interaction.user.id, username, nowTs, expectedEnd, note]
       );
-      await interaction.deferUpdate();
 
+      await interaction.reply({ content: `🟩 ${username} が利用を開始しました。${expectedEnd ? `終了予定: ${fmtTs(expectedEnd)}` : ''} ${note ? `メモ: ${note}` : ''}`, ephemeral: true });
       await sendLog(`🟩 ${username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
@@ -251,7 +244,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// --- auto-expire ---
+// --- auto-expire check every minute ---
 setInterval(async () => {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -270,12 +263,12 @@ setInterval(async () => {
   } catch (err) {
     console.error('auto-expire error:', err);
   }
-}, 60*1000);
+}, 60 * 1000);
 
 // --- start up ---
 (async () => {
   try {
-    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until設定するまで失敗します。');
+    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until設定してください。');
     await initDb();
     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
     await client.login(DISCORD_TOKEN);
@@ -285,6 +278,7 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
 
 
 
@@ -541,6 +535,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
