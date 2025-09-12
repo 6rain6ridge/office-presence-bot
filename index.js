@@ -12,30 +12,6 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  StringSelectMenuBuilder,
-  StringSelectMenuOptionBuilder,
-  InteractionType
-} = require('discord.js');
-
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // 履歴ログ用チャンネル
-
-if (!DISCORD_TOKEN) {
-  console.error('DISCORD_TOKEN is required');
-  process.exit(1);// index.js
-require('dotenv').config();
-const express = require('express');
-const { Pool } = require('pg');
-const {
-  Client,
-  GatewayIntentBits,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
   InteractionType
 } = require('discord.js');
 
@@ -313,6 +289,7 @@ setInterval(async () => {
 
 
 
+
 // // index.js
 // require('dotenv').config();
 // const express = require('express');
@@ -562,6 +539,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
