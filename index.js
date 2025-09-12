@@ -204,7 +204,7 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferUpdate();
 
         const displayName = interaction.member?.displayName || interaction.user.username;
-        await sendLog(`🟥 ${displayName} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）${get.note ? ` ／メモ: ${get.note}` : ''}`);
+        await sendLog(`🟥 ${displayName} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）${get.note ? ` 📝: ${get.note}` : ''}`);
 
         const panels = await pool.query('SELECT channel_id FROM panel');
         for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -269,7 +269,7 @@ setInterval(async () => {
       );
       await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
 
-      await sendLog(`⏰ ${r.username} 利用終了（開始: ${fmtTs(r.start)} → 自動終了: ${fmtHHMM(r.expected_end)}）${r.note ? ` ／メモ: ${r.note}` : ''}`);
+      await sendLog(`⏰ ${r.username} 利用終了（開始: ${fmtTs(r.start)} → 自動終了: ${fmtHHMM(r.expected_end)}）${r.note ? ` 📝: ${r.note}` : ''}`);
     }
     const panels = await pool.query('SELECT channel_id FROM panel');
     for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -550,6 +550,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
