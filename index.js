@@ -1,137 +1,272 @@
-const { Client, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
-const { Pool } = require('pg');
+// index.js
+require('dotenv').config();
 const express = require('express');
+const { Pool } = require('pg');
+const {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
+} = require('discord.js');
 
-// Discord クライアント設定
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-  partials: [Partials.Channel],
-});
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // 履歴ログ用チャンネル
 
-// 環境変数
-const TOKEN = process.env.DISCORD_TOKEN;
-const DATABASE_URL = process.env.DATABASE_URL;
-const PRESENCE_CHANNEL_ID = process.env.PRESENCE_CHANNEL_ID; // 利用状況パネルのチャンネル
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;           // 履歴用チャンネル
+if (!DISCORD_TOKEN) {
+  console.error('DISCORD_TOKEN is required');
+  process.exit(1);
+}
 
-// Postgres 接続プール
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+// --- Express for Render health check ---
+const app = express();
+app.get('/', (req, res) => res.send('OK - office tracker'));
+const PORT = process.env.PORT || 10000;
 
-// データベース初期化
-(async () => {
+// --- Postgres (Neon) pool configuration ---
+const poolConfig = {
+  connectionString: process.env.DATABASE_URL || null,
+  max: process.env.PG_MAX ? Number(process.env.PG_MAX) : 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 20000
+};
+if (process.env.DATABASE_SSL === 'true') {
+  poolConfig.ssl = { rejectUnauthorized: false };
+}
+const pool = new Pool(poolConfig);
+
+// --- Discord client ---
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+// --- DB initialization ---
+async function initDb() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS presences (
-      id SERIAL PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      user_name TEXT NOT NULL,
-      start_time TIMESTAMP NOT NULL,
-      end_time TIMESTAMP
-    )
-  `);
-  console.log('DB が初期化されました');
-})();
-
-// パネル更新関数
-async function updatePresencePanel(client, channel) {
-  const res = await pool.query(
-    'SELECT * FROM presences WHERE end_time IS NULL ORDER BY start_time'
-  );
-
-  const embed = new EmbedBuilder()
-    .setTitle('📌 事務所 利用状況（現在）')
-    .setColor(0x2b6cb0);
-
-  if (res.rows.length === 0) {
-    embed.setDescription('現在、事務所を利用している人はいません。');
-  } else {
-    embed.setDescription(
-      res.rows
-        .map(
-          row =>
-            `• <@${row.user_id}> — 開始: ${row.start_time.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}`
-        )
-        .join('\n')
+    CREATE TABLE IF NOT EXISTS active_users (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      start BIGINT,
+      expected_end BIGINT,
+      note TEXT
     );
-  }
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS panel (
+      channel_id TEXT PRIMARY KEY,
+      message_id TEXT
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS history (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT,
+      username TEXT,
+      start BIGINT,
+      ended_at BIGINT,
+      note TEXT
+    );
+  `);
+  console.log('DB initialized');
+}
 
+// --- Helpers ---
+function fmtTs(ts) {
+  if (!ts) return '未設定';
+  const d = new Date(Number(ts) * 1000);
+  return `${d.getFullYear()}/${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+}
+function panelComponents() {
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('start').setLabel('利用します').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('end').setLabel('退出します').setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId('office_join').setLabel('利用します').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('office_leave').setLabel('退出します').setStyle(ButtonStyle.Danger)
   );
-
-  // 既存メッセージを更新 or 新規作成
-  const messages = await channel.messages.fetch({ limit: 10 });
-  const panelMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0);
-
-  if (panelMsg) {
-    await panelMsg.edit({ embeds: [embed], components: [row] });
-  } else {
-    await channel.send({ embeds: [embed], components: [row] });
+  return [row];
+}
+async function buildPanelEmbed(channelId) {
+  const res = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users ORDER BY start');
+  const rows = res.rows || [];
+  let desc = '';
+  if (rows.length === 0) desc = '現在、事務所にいる人はいません。';
+  else {
+    for (const r of rows) {
+      desc += `• <@${r.user_id}> — 開始: ${fmtTs(r.start)} / 終了予定: ${r.expected_end ? fmtTs(r.expected_end) : '未設定'} ${r.note ? `／${r.note}` : ''}\n`;
+    }
+  }
+  return new EmbedBuilder()
+    .setTitle('📌 事務所 利用状況（現在）')
+    .setDescription(desc)
+    .setFooter({ text: '「利用します」を押して登録／退出時は「退出します」を押してください。' })
+    .setTimestamp();
+}
+async function updatePanel(channelId) {
+  try {
+    const rr = await pool.query('SELECT message_id FROM panel WHERE channel_id = $1', [channelId]);
+    if (!rr.rows.length) return;
+    const messageId = rr.rows[0].message_id;
+    const channel = await client.channels.fetch(channelId);
+    if (!channel) return;
+    const message = await channel.messages.fetch(messageId);
+    if (!message) return;
+    await message.edit({ embeds: [await buildPanelEmbed(channelId)], components: panelComponents() });
+  } catch (err) {
+    console.error('updatePanel error:', err);
   }
 }
 
-// 起動時処理
-client.once('ready', async () => {
-  console.log('Discord クライアントがログインしました');
-  const channel = await client.channels.fetch(PRESENCE_CHANNEL_ID);
-  if (channel) await updatePresencePanel(client, channel);
-});
+// --- Send log to history channel ---
+async function sendLog(message) {
+  if (!LOG_CHANNEL_ID) return;
+  try {
+    const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
+    if (logChannel) await logChannel.send(message);
+  } catch (err) {
+    console.error('sendLog error:', err);
+  }
+}
 
-// ボタン処理
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isButton()) return;
+// --- Build select menu for times ---
+function buildTimeSelect() {
+  const options = [];
+  for (let h = 0; h < 24; h++) {
+    for (let m of [0, 30]) {
+      const label = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+      options.push({ label, value: label });
+    }
+  }
+  return new StringSelectMenuBuilder()
+    .setCustomId('select_endtime')
+    .setPlaceholder('終了予定時刻を選択（任意）')
+    .addOptions({ label: '未設定', value: 'none' }, ...options);
+}
 
-  const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
-
-  if (interaction.customId === 'start') {
-    await pool.query(
-      'INSERT INTO presences (user_id, user_name, start_time) VALUES ($1, $2, NOW())',
-      [interaction.user.id, interaction.user.username]
-    );
-
-    await interaction.reply({
-      content: `✅ ${interaction.user.username} さんが事務所を利用開始しました！`
-    });
-
-    if (logChannel) {
-      await logChannel.send(`📥 ${interaction.user.username} さんが入室しました。(${new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })})`);
+// --- Interaction handling ---
+client.on('interactionCreate', async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'setup-office') {
+        const embed = await buildPanelEmbed(interaction.channelId);
+        const sent = await interaction.channel.send({ embeds: [embed], components: panelComponents() });
+        await pool.query('INSERT INTO panel(channel_id, message_id) VALUES($1,$2) ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id', [interaction.channelId, sent.id]);
+        await interaction.reply({ content: '事務所パネルを設置しました。', ephemeral: true });
+        return;
+      }
+      if (interaction.commandName === 'remove-office') {
+        await pool.query('DELETE FROM panel WHERE channel_id = $1', [interaction.channelId]);
+        await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました。', ephemeral: true });
+        return;
+      }
     }
 
-    await updatePresencePanel(client, interaction.channel);
-  }
+    if (interaction.isButton()) {
+      if (interaction.customId === 'office_join') {
+        // まず終了時刻の選択肢を提示
+        const row = new ActionRowBuilder().addComponents(buildTimeSelect());
+        await interaction.reply({ content: '予定終了時刻を選んでください（未設定でもOK）。', components: [row], ephemeral: true });
+        return;
+      }
+      if (interaction.customId === 'office_leave') {
+        const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
+        if (!r.rows.length) {
+          await interaction.reply({ content: 'あなたは現在登録されていません。', ephemeral: true });
+          return;
+        }
+        const get = r.rows[0];
+        const now = Math.floor(Date.now() / 1000);
+        await pool.query('INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)', [get.user_id, get.username, get.start, now, get.note]);
+        await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
+        await interaction.deferUpdate();
 
-  if (interaction.customId === 'end') {
-    await pool.query(
-      'UPDATE presences SET end_time = NOW() WHERE user_id = $1 AND end_time IS NULL',
-      [interaction.user.id]
-    );
+        await sendLog(`🟥 ${interaction.user.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
 
-    await interaction.reply({
-      content: `👋 ${interaction.user.username} さんが退出しました！`
-    });
-
-    if (logChannel) {
-      await logChannel.send(`📤 ${interaction.user.username} さんが退出しました。(${new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })})`);
+        const panels = await pool.query('SELECT channel_id FROM panel');
+        for (const p of panels.rows) await updatePanel(p.channel_id);
+        return;
+      }
     }
 
-    await updatePresencePanel(client, interaction.channel);
+    if (interaction.isStringSelectMenu() && interaction.customId === 'select_endtime') {
+      // 終了時刻を選んだあと → モーダルでメモを入力
+      const value = interaction.values[0];
+      let expectedEnd = null;
+      if (value !== 'none') {
+        const [hh, mm] = value.split(':').map(x => parseInt(x, 10));
+        const now = new Date();
+        const endDate = new Date(now);
+        endDate.setHours(hh, mm, 0, 0);
+        if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
+        expectedEnd = Math.floor(endDate.getTime() / 1000);
+      }
+      // 保存予定時刻を一時的に保持
+      interaction.client.tmpEndTimes = interaction.client.tmpEndTimes || {};
+      interaction.client.tmpEndTimes[interaction.user.id] = expectedEnd;
+
+      const modal = new ModalBuilder().setCustomId('office_note_modal').setTitle('事務所利用登録（メモ入力）');
+      const noteInput = new TextInputBuilder().setCustomId('note').setLabel('用途やメモ（任意）').setStyle(TextInputStyle.Short).setRequired(false);
+      modal.addComponents(new ActionRowBuilder().addComponents(noteInput));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'office_note_modal') {
+      const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
+      if (exists.rows.length) {
+        await interaction.reply({ content: '既に事務所利用中です。退出する場合は「退出します」を押してください。', ephemeral: true });
+        return;
+      }
+      const note = interaction.fields.getTextInputValue('note') || '';
+      const expectedEnd = interaction.client.tmpEndTimes?.[interaction.user.id] || null;
+      delete interaction.client.tmpEndTimes?.[interaction.user.id];
+
+      const nowTs = Math.floor(Date.now() / 1000);
+      const username = `${interaction.user.username}#${interaction.user.discriminator}`;
+      await pool.query('INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)', [interaction.user.id, username, nowTs, expectedEnd, note]);
+      await interaction.deferUpdate();
+
+      await sendLog(`🟩 ${interaction.user.username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
+
+      const panels = await pool.query('SELECT channel_id FROM panel');
+      for (const p of panels.rows) await updatePanel(p.channel_id);
+    }
+  } catch (err) {
+    console.error('interaction error:', err);
+    try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
   }
 });
 
-// Render 用 keep-alive
-const app = express();
-app.get('/', (req, res) => res.send('Bot is running.'));
-app.listen(10000, () => console.log('HTTP サーバーが 10000 をリッスンしています'));
+// --- auto-expire ---
+setInterval(async () => {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const rr = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users WHERE expected_end IS NOT NULL AND expected_end <= $1', [now]);
+    for (const r of rr.rows) {
+      await pool.query('INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)', [r.user_id, r.username, r.start, r.expected_end, r.note]);
+      await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
+      await sendLog(`⏰ ${r.username} の利用時間が終了しました（開始: ${fmtTs(r.start)} → 自動終了: ${fmtTs(r.expected_end)}）。${r.note ? ` メモ: ${r.note}` : ''}`);
+    }
+    const panels = await pool.query('SELECT channel_id FROM panel');
+    for (const p of panels.rows) await updatePanel(p.channel_id);
+  } catch (err) {
+    console.error('auto-expire error:', err);
+  }
+}, 60 * 1000);
 
-client.login(TOKEN);
-
-
-
-
-
+// --- startup ---
+(async () => {
+  try {
+    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set');
+    await initDb();
+    app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
+    await client.login(DISCORD_TOKEN);
+    console.log('Discord client logged in');
+  } catch (err) {
+    console.error('startup error', err);
+    process.exit(1);
+  }
+})();
 
 
 
@@ -386,4 +521,5 @@ client.login(TOKEN);
 //     process.exit(1);
 //   }
 // })();
+
 
