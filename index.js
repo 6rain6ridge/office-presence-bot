@@ -15,6 +15,8 @@ const {
 } = require('discord.js');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // 履歴ログ用チャンネル
+
 if (!DISCORD_TOKEN) {
   console.error('DISCORD_TOKEN is required');
   process.exit(1);
@@ -28,12 +30,10 @@ const PORT = process.env.PORT || 10000;
 // --- Postgres (Neon) pool configuration ---
 const poolConfig = {
   connectionString: process.env.DATABASE_URL || null,
-  // keep pool small to avoid too many client connections
   max: process.env.PG_MAX ? Number(process.env.PG_MAX) : 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 20000
 };
-// Neon typically requires SSL; allow override by env
 if (process.env.DATABASE_SSL === 'true') {
   poolConfig.ssl = { rejectUnauthorized: false };
 }
@@ -59,16 +59,16 @@ async function initDb() {
       message_id TEXT
     );
   `);
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS history (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT,
-    username TEXT,
-    start BIGINT,
-    ended_at BIGINT,
-    note TEXT
-  );
-`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS history (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT,
+      username TEXT,
+      start BIGINT,
+      ended_at BIGINT,
+      note TEXT
+    );
+  `);
   console.log('DB initialized');
 }
 
@@ -116,6 +116,17 @@ async function updatePanel(channelId) {
   }
 }
 
+// --- Send log to history channel ---
+async function sendLog(message) {
+  if (!LOG_CHANNEL_ID) return;
+  try {
+    const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
+    if (logChannel) await logChannel.send(message);
+  } catch (err) {
+    console.error('sendLog error:', err);
+  }
+}
+
 // --- Interaction handling (buttons, modal, commands) ---
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -140,9 +151,7 @@ client.on('interactionCreate', async (interaction) => {
         const modal = new ModalBuilder().setCustomId('office_join_modal').setTitle('事務所利用登録');
         const endInput = new TextInputBuilder().setCustomId('endTime').setLabel('予定終了時刻（任意、HH:MM）').setStyle(TextInputStyle.Short).setRequired(false);
         const noteInput = new TextInputBuilder().setCustomId('note').setLabel('用途やメモ（任意）').setStyle(TextInputStyle.Short).setRequired(false);
-        const row1 = new ActionRowBuilder().addComponents(endInput);
-        const row2 = new ActionRowBuilder().addComponents(noteInput);
-        modal.addComponents(row1, row2);
+        modal.addComponents(new ActionRowBuilder().addComponents(endInput), new ActionRowBuilder().addComponents(noteInput));
         await interaction.showModal(modal);
         return;
       }
@@ -155,9 +164,12 @@ client.on('interactionCreate', async (interaction) => {
         const get = r.rows[0];
         const now = Math.floor(Date.now() / 1000);
         await pool.query('INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',[get.user_id, get.username, get.start, now, get.note]);
-
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
-        // await interaction.reply({ content: `退出を記録しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。`, ephemeral: true });
+        await interaction.deferUpdate();
+
+        // 履歴チャンネルに送信
+        await sendLog(`🟥 ${interaction.user.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
+
         const panels = await pool.query('SELECT channel_id FROM panel');
         for (const p of panels.rows) await updatePanel(p.channel_id);
         return;
@@ -183,13 +195,17 @@ client.on('interactionCreate', async (interaction) => {
           if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
           expectedEnd = Math.floor(endDate.getTime() / 1000);
         } else {
-          await interaction.reply({ content: '予定終了時刻は HH:MM 形式で指定してください（例: 15:30）。無効な形式なので予定終了は未設定で登録します。', ephemeral: true });
+          await interaction.reply({ content: '予定終了時刻は HH:MM 形式で指定してください。無効な形式なので予定終了は未設定で登録します。', ephemeral: true });
         }
       }
       const nowTs = Math.floor(Date.now() / 1000);
       const username = `${interaction.user.username}#${interaction.user.discriminator}`;
       await pool.query('INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)', [interaction.user.id, username, nowTs, expectedEnd, note]);
-      // await interaction.reply({ content: `事務所利用を登録しました（開始: ${fmtTs(nowTs)}）。`, ephemeral: true });
+      await interaction.deferUpdate();
+
+      // 履歴チャンネルに送信
+      await sendLog(`🟩 ${interaction.user.username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
+
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
     }
@@ -206,8 +222,10 @@ setInterval(async () => {
     const rr = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users WHERE expected_end IS NOT NULL AND expected_end <= $1', [now]);
     for (const r of rr.rows) {
       await pool.query('INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',[r.user_id, r.username, r.start, r.expected_end, r.note]);
-
       await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
+
+      // 履歴チャンネルに送信
+      await sendLog(`⏰ ${r.username} の利用時間が終了しました（開始: ${fmtTs(r.start)} → 自動終了: ${fmtTs(r.expected_end)}）。${r.note ? ` メモ: ${r.note}` : ''}`);
     }
     const panels = await pool.query('SELECT channel_id FROM panel');
     for (const p of panels.rows) await updatePanel(p.channel_id);
@@ -229,5 +247,3 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
-
-
