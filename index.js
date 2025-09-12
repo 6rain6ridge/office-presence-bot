@@ -104,7 +104,7 @@ async function buildPanelEmbed(channelId) {
     for (const r of rows) {
       const startJST = fmtTs(r.start);
       const endHHMM = r.expected_end ? fmtHHMM(r.expected_end) : '未設定';
-      desc += `🟢 ${r.username}\n  開始: ${startJST} / 終了予定: ${endHHMM}${r.note ? ` ／${r.note}` : ''}\n`;
+      desc += `🟢 ${r.username}  開始: ${startJST} / 終了予定: ${endHHMM}${r.note ? ` 📝${r.note}` : ''}\n`;
     }
   }
   return new EmbedBuilder()
@@ -550,6 +550,7 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
 
