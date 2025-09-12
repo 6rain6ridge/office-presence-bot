@@ -9,10 +9,10 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  StringSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  StringSelectMenuBuilder
 } = require('discord.js');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -35,9 +35,7 @@ const poolConfig = {
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 20000
 };
-if (process.env.DATABASE_SSL === 'true') {
-  poolConfig.ssl = { rejectUnauthorized: false };
-}
+if (process.env.DATABASE_SSL === 'true') poolConfig.ssl = { rejectUnauthorized: false };
 const pool = new Pool(poolConfig);
 
 // --- Discord client ---
@@ -117,7 +115,7 @@ async function updatePanel(channelId) {
   }
 }
 
-// --- Send log to history channel ---
+// --- 履歴ログ送信 ---
 async function sendLog(message) {
   if (!LOG_CHANNEL_ID) return;
   try {
@@ -128,46 +126,58 @@ async function sendLog(message) {
   }
 }
 
-// --- Build select menu for times ---
-function buildTimeSelect() {
-  const options = [];
-  for (let h = 0; h < 24; h++) {
-    for (let m of [0, 30]) {
-      const label = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
-      options.push({ label, value: label });
-    }
-  }
-  return new StringSelectMenuBuilder()
-    .setCustomId('select_endtime')
-    .setPlaceholder('終了予定時刻を選択（任意）')
-    .addOptions({ label: '未設定', value: 'none' }, ...options);
-}
-
 // --- Interaction handling ---
 client.on('interactionCreate', async (interaction) => {
   try {
+    // --- コマンド ---
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === 'setup-office') {
+      const cmd = interaction.commandName;
+      if (cmd === 'setup-office') {
         const embed = await buildPanelEmbed(interaction.channelId);
         const sent = await interaction.channel.send({ embeds: [embed], components: panelComponents() });
         await pool.query('INSERT INTO panel(channel_id, message_id) VALUES($1,$2) ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id', [interaction.channelId, sent.id]);
         await interaction.reply({ content: '事務所パネルを設置しました。', ephemeral: true });
         return;
       }
-      if (interaction.commandName === 'remove-office') {
+      if (cmd === 'remove-office') {
         await pool.query('DELETE FROM panel WHERE channel_id = $1', [interaction.channelId]);
-        await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました。', ephemeral: true });
+        await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました（メッセージ自体は残ります）。', ephemeral: true });
         return;
       }
     }
 
+    // --- ボタン ---
     if (interaction.isButton()) {
       if (interaction.customId === 'office_join') {
-        // まず終了時刻の選択肢を提示
-        const row = new ActionRowBuilder().addComponents(buildTimeSelect());
-        await interaction.reply({ content: '予定終了時刻を選んでください（未設定でもOK）。', components: [row], ephemeral: true });
+        // メモ入力モーダル
+        const noteModal = new ModalBuilder().setCustomId('note_modal').setTitle('事務所利用登録');
+        const noteInput = new TextInputBuilder().setCustomId('note').setLabel('用途やメモ（任意）').setStyle(TextInputStyle.Short).setRequired(false);
+        noteModal.addComponents(new ActionRowBuilder().addComponents(noteInput));
+
+        // 終了予定時刻選択（午前・午後）
+        const morningOptions = [];
+        for (let h = 0; h < 12; h++) {
+          morningOptions.push({ label: `${h}:00`, value: `${h}:00` });
+          morningOptions.push({ label: `${h}:30`, value: `${h}:30` });
+        }
+        const afternoonOptions = [];
+        for (let h = 12; h < 24; h++) {
+          afternoonOptions.push({ label: `${h}:00`, value: `${h}:00` });
+          afternoonOptions.push({ label: `${h}:30`, value: `${h}:30` });
+        }
+        const morningSelect = new StringSelectMenuBuilder().setCustomId('endtime_morning').setPlaceholder('終了予定時刻（午前）').addOptions(morningOptions);
+        const afternoonSelect = new StringSelectMenuBuilder().setCustomId('endtime_afternoon').setPlaceholder('終了予定時刻（午後）').addOptions(afternoonOptions);
+
+        await interaction.reply({
+          content: '終了予定時刻を選択してください ⏰',
+          components: [new ActionRowBuilder().addComponents(morningSelect), new ActionRowBuilder().addComponents(afternoonSelect)],
+          ephemeral: true
+        });
+
+        await interaction.showModal(noteModal);
         return;
       }
+
       if (interaction.customId === 'office_leave') {
         const r = await pool.query('SELECT * FROM active_users WHERE user_id = $1', [interaction.user.id]);
         if (!r.rows.length) {
@@ -180,6 +190,7 @@ client.on('interactionCreate', async (interaction) => {
         await pool.query('DELETE FROM active_users WHERE user_id = $1', [interaction.user.id]);
         await interaction.deferUpdate();
 
+        // 履歴チャンネルに送信
         await sendLog(`🟥 ${interaction.user.username} が退出しました（開始: ${fmtTs(get.start)} → 退出: ${fmtTs(now)}）。${get.note ? ` メモ: ${get.note}` : ''}`);
 
         const panels = await pool.query('SELECT channel_id FROM panel');
@@ -188,56 +199,36 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId === 'select_endtime') {
-      // 終了時刻を選んだあと → モーダルでメモを入力
-      const value = interaction.values[0];
-      let expectedEnd = null;
-      if (value !== 'none') {
-        const [hh, mm] = value.split(':').map(x => parseInt(x, 10));
-        const now = new Date();
-        const endDate = new Date(now);
-        endDate.setHours(hh, mm, 0, 0);
-        if (endDate.getTime() <= now.getTime()) endDate.setDate(endDate.getDate() + 1);
-        expectedEnd = Math.floor(endDate.getTime() / 1000);
+    // --- プルダウン選択 ---
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === 'endtime_morning' || interaction.customId === 'endtime_afternoon') {
+        const endText = interaction.values[0];
+        await interaction.update({ content: `✅ 終了予定時刻を **${endText}** に設定しました！`, components: [] });
+        // ここで後続処理として DB 登録や履歴送信に繋げられる
       }
-      // 保存予定時刻を一時的に保持
-      interaction.client.tmpEndTimes = interaction.client.tmpEndTimes || {};
-      interaction.client.tmpEndTimes[interaction.user.id] = expectedEnd;
-
-      const modal = new ModalBuilder().setCustomId('office_note_modal').setTitle('事務所利用登録（メモ入力）');
-      const noteInput = new TextInputBuilder().setCustomId('note').setLabel('用途やメモ（任意）').setStyle(TextInputStyle.Short).setRequired(false);
-      modal.addComponents(new ActionRowBuilder().addComponents(noteInput));
-      await interaction.showModal(modal);
-      return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === 'office_note_modal') {
-      const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
-      if (exists.rows.length) {
-        await interaction.reply({ content: '既に事務所利用中です。退出する場合は「退出します」を押してください。', ephemeral: true });
-        return;
-      }
+    // --- モーダル送信（メモ入力） ---
+    if (interaction.isModalSubmit() && interaction.customId === 'note_modal') {
       const note = interaction.fields.getTextInputValue('note') || '';
-      const expectedEnd = interaction.client.tmpEndTimes?.[interaction.user.id] || null;
-      delete interaction.client.tmpEndTimes?.[interaction.user.id];
-
       const nowTs = Math.floor(Date.now() / 1000);
       const username = `${interaction.user.username}#${interaction.user.discriminator}`;
-      await pool.query('INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)', [interaction.user.id, username, nowTs, expectedEnd, note]);
-      await interaction.deferUpdate();
+      await pool.query('INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)', [interaction.user.id, username, nowTs, null, note]);
 
-      await sendLog(`🟩 ${interaction.user.username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtTs(expectedEnd)}` : ''}）。${note ? ` メモ: ${note}` : ''}`);
+      // 履歴チャンネルに送信
+      await sendLog(`🟩 ${interaction.user.username} が利用を開始しました（開始: ${fmtTs(nowTs)}）。${note ? ` メモ: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
     }
+
   } catch (err) {
     console.error('interaction error:', err);
     try { if (interaction && !interaction.replied) await interaction.reply({ content: '内部エラーが発生しました。', ephemeral: true }); } catch {}
   }
 });
 
-// --- auto-expire ---
+// --- 自動終了チェック ---
 setInterval(async () => {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -254,10 +245,10 @@ setInterval(async () => {
   }
 }, 60 * 1000);
 
-// --- startup ---
+// --- 起動 ---
 (async () => {
   try {
-    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set');
+    if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB操作は失敗します');
     await initDb();
     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
     await client.login(DISCORD_TOKEN);
@@ -521,5 +512,6 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
+
 
 
