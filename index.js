@@ -27,12 +27,9 @@ if (!DISCORD_TOKEN) {
 const app = express();
 app.use(express.json());
 
-// Ping 用エンドポイント（Discord Interaction）
-// ここは Render 側で必須、署名検証は省略しています
 app.post('/interactions', (req, res) => {
-  res.json({ type: 1 }); // PONG
+  res.json({ type: 1 });
 });
-
 app.get('/', (req, res) => res.send('OK - office tracker'));
 const PORT = process.env.PORT || 10000;
 
@@ -58,6 +55,7 @@ async function initDb() {
       user_id TEXT PRIMARY KEY,
       username TEXT,
       start BIGINT,
+      planned_start BIGINT,
       expected_end BIGINT,
       note TEXT
     );
@@ -85,10 +83,9 @@ async function initDb() {
 function fmtTs(ts) {
   if (!ts) return '未設定';
   const d = new Date(Number(ts) * 1000);
-  const jst = new Date(d.getTime() + 9 * 3600 * 1000); // JST
+  const jst = new Date(d.getTime() + 9 * 3600 * 1000);
   return `${jst.getFullYear()}/${(jst.getMonth()+1).toString().padStart(2,'0')}/${jst.getDate().toString().padStart(2,'0')} ${jst.getHours().toString().padStart(2,'0')}:${jst.getMinutes().toString().padStart(2,'0')}`;
 }
-
 function fmtHHMM(ts) {
   if (!ts) return '未設定';
   const d = new Date(Number(ts) * 1000);
@@ -104,16 +101,28 @@ function panelComponents() {
   return [row];
 }
 
+// Embed生成
 async function buildPanelEmbed(channelId) {
-  const res = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users ORDER BY start');
+  const res = await pool.query('SELECT user_id, username, start, planned_start, expected_end, note FROM active_users ORDER BY start');
   const rows = res.rows || [];
   let desc = '';
+  const now = Math.floor(Date.now() / 1000);
+
   if (rows.length === 0) desc = '現在、事務所にいる人はいません。';
   else {
     for (const r of rows) {
-      desc += `🟢 ${r.username} — 開始: ${fmtTs(r.start)} / 終了予定: ${r.expected_end ? fmtHHMM(r.expected_end) : '未設定'} ${r.note ? `📝${r.note}` : ''}\n`;
+      let statusIcon = '🟢';
+      let startDisplay = fmtTs(r.start);
+
+      if (r.planned_start && r.planned_start > now) {
+        statusIcon = '🟡';
+        startDisplay = fmtTs(r.planned_start);
+      }
+
+      desc += `${statusIcon} ${r.username} — 開始: ${startDisplay} / 終了予定: ${r.expected_end ? fmtHHMM(r.expected_end) : '未設定'} ${r.note ? `📝${r.note}` : ''}\n`;
     }
   }
+
   return new EmbedBuilder()
     .setTitle('📌 事務所 利用状況（現在）')
     .setDescription(desc)
@@ -149,38 +158,39 @@ async function sendLog(message) {
 // --- Discord Interaction handling ---
 client.on('interactionCreate', async (interaction) => {
   try {
-    // スラッシュコマンド
     if (interaction.isChatInputCommand()) {
-      const cmd = interaction.commandName;
-      if (cmd === 'setup-office') {
+      if (interaction.commandName === 'setup-office') {
         const embed = await buildPanelEmbed(interaction.channelId);
         const sent = await interaction.channel.send({ embeds: [embed], components: panelComponents() });
         await pool.query(
           'INSERT INTO panel(channel_id, message_id) VALUES($1,$2) ON CONFLICT (channel_id) DO UPDATE SET message_id = EXCLUDED.message_id',
           [interaction.channelId, sent.id]
         );
-        await interaction.deferReply({ ephemeral: true });
-        await interaction.editReply('事務所パネルを設置しました。');
+        await interaction.reply({ content: '事務所パネルを設置しました。', ephemeral: true });
         return;
       }
-      if (cmd === 'remove-office') {
+      if (interaction.commandName === 'remove-office') {
         await pool.query('DELETE FROM panel WHERE channel_id = $1', [interaction.channelId]);
-        await interaction.deferReply({ ephemeral: true });
-        await interaction.editReply('このチャンネルの事務所パネル情報を削除しました（メッセージ自体は残ります）。');
+        await interaction.reply({ content: 'このチャンネルの事務所パネル情報を削除しました。', ephemeral: true });
         return;
       }
     }
 
-    // ボタン処理
     if (interaction.isButton()) {
       if (interaction.customId === 'office_join') {
         const modal = new ModalBuilder()
           .setCustomId('office_join_modal')
           .setTitle('事務所利用登録');
 
-        const endTimeInput = new TextInputBuilder()
+        const startInput = new TextInputBuilder()
+          .setCustomId('startTime')
+          .setLabel('利用開始予定時刻（例: 09:00, 空欄=すぐ開始）')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false);
+
+        const endInput = new TextInputBuilder()
           .setCustomId('endTime')
-          .setLabel('終了予定時刻（例: 09:00, 13:30）')
+          .setLabel('終了予定時刻（例: 18:00）')
           .setStyle(TextInputStyle.Short)
           .setRequired(false);
 
@@ -190,8 +200,11 @@ client.on('interactionCreate', async (interaction) => {
           .setStyle(TextInputStyle.Short)
           .setRequired(false);
 
-        modal.addComponents(new ActionRowBuilder().addComponents(endTimeInput));
-        modal.addComponents(new ActionRowBuilder().addComponents(noteInput));
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(startInput),
+          new ActionRowBuilder().addComponents(endInput),
+          new ActionRowBuilder().addComponents(noteInput)
+        );
 
         await interaction.showModal(modal);
         return;
@@ -205,6 +218,7 @@ client.on('interactionCreate', async (interaction) => {
         }
         const get = r.rows[0];
         const now = Math.floor(Date.now() / 1000);
+
         await pool.query(
           'INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',
           [get.user_id, get.username, get.start, now, get.note]
@@ -220,22 +234,23 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // モーダル送信
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
+      const startTimeText = interaction.fields.getTextInputValue('startTime') || '';
       const endTimeText = interaction.fields.getTextInputValue('endTime') || '';
       const note = interaction.fields.getTextInputValue('note') || '';
-      let expectedEnd = null;
 
-      if (endTimeText) {
-        const m = endTimeText.match(/^(\d{1,2}):(\d{2})$/);
+      const now = new Date();
+      const jstNow = new Date(now.getTime() + 9 * 3600 * 1000);
+
+      let plannedStart = null;
+      let startTs = Math.floor(Date.now() / 1000);
+
+      if (startTimeText) {
+        const m = startTimeText.match(/^(\d{1,2}):(\d{2})$/);
         if (m) {
           const hh = parseInt(m[1], 10);
           const mm = parseInt(m[2], 10);
-
-          // JST 時間処理
-          const now = new Date();
-          const jstNow = new Date(now.getTime() + 9 * 3600 * 1000);
-          const endJST = new Date(Date.UTC(
+          const sJST = new Date(Date.UTC(
             jstNow.getUTCFullYear(),
             jstNow.getUTCMonth(),
             jstNow.getUTCDate(),
@@ -243,55 +258,82 @@ client.on('interactionCreate', async (interaction) => {
             mm,
             0
           ));
-          if (endJST.getTime() <= jstNow.getTime()) endJST.setUTCDate(endJST.getUTCDate() + 1);
-          expectedEnd = Math.floor(endJST.getTime() / 1000 - 9 * 3600);
+          if (sJST.getTime() <= jstNow.getTime()) sJST.setUTCDate(sJST.getUTCDate() + 1);
+          plannedStart = Math.floor(sJST.getTime() / 1000 - 9 * 3600);
+          startTs = plannedStart;
         }
       }
 
-      const nowTs = Math.floor(Date.now() / 1000);
+      let expectedEnd = null;
+      if (endTimeText) {
+        const m = endTimeText.match(/^(\d{1,2}):(\d{2})$/);
+        if (m) {
+          const hh = parseInt(m[1], 10);
+          const mm = parseInt(m[2], 10);
+          const eJST = new Date(Date.UTC(
+            jstNow.getUTCFullYear(),
+            jstNow.getUTCMonth(),
+            jstNow.getUTCDate(),
+            hh,
+            mm,
+            0
+          ));
+          if (eJST.getTime() <= jstNow.getTime()) eJST.setUTCDate(eJST.getUTCDate() + 1);
+          expectedEnd = Math.floor(eJST.getTime() / 1000 - 9 * 3600);
+        }
+      }
+
       const username = interaction.member?.displayName || interaction.user.username;
 
       await pool.query(
-        'INSERT INTO active_users(user_id, username, start, expected_end, note) VALUES($1,$2,$3,$4,$5)',
-        [interaction.user.id, username, nowTs, expectedEnd, note]
+        'INSERT INTO active_users(user_id, username, start, planned_start, expected_end, note) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (user_id) DO UPDATE SET username=$2, start=$3, planned_start=$4, expected_end=$5, note=$6',
+        [interaction.user.id, username, startTs, plannedStart, expectedEnd, note]
       );
 
-      await sendLog(`🟩 ${username} が利用を開始しました（開始: ${fmtTs(nowTs)}${expectedEnd ? ` → 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）。${note ? ` 📝: ${note}` : ''}`);
+      await sendLog(`🟩 ${username} が利用を登録しました（${plannedStart ? `開始予定: ${fmtHHMM(plannedStart)}` : `開始: ${fmtTs(startTs)}`} ${expectedEnd ? `→ 終了予定: ${fmtHHMM(expectedEnd)}` : ''}）。${note ? ` 📝: ${note}` : ''}`);
 
       const panels = await pool.query('SELECT channel_id FROM panel');
       for (const p of panels.rows) await updatePanel(p.channel_id);
 
       await interaction.deferUpdate();
     }
-
   } catch (err) {
     console.error('interaction error:', err);
     try { if (interaction && !interaction.replied) await interaction.deferUpdate(); } catch {}
   }
 });
 
-// --- 自動終了チェック（1分ごと） ---
+// --- 自動チェック ---
 setInterval(async () => {
   try {
     const now = Math.floor(Date.now() / 1000);
-    const rr = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users WHERE expected_end IS NOT NULL AND expected_end <= $1', [now]);
-    for (const r of rr.rows) {
+
+    // 開始予定時刻を過ぎた人を利用中に切り替え（🟡→🟢）
+    const pending = await pool.query('SELECT user_id, username, planned_start FROM active_users WHERE planned_start IS NOT NULL AND planned_start <= $1', [now]);
+    for (const r of pending.rows) {
+      await pool.query('UPDATE active_users SET planned_start = NULL WHERE user_id = $1', [r.user_id]);
+      await sendLog(`▶️ ${r.username} が利用を開始しました（予定時刻 ${fmtHHMM(r.planned_start)} 到達）。`);
+    }
+
+    // 終了予定を過ぎた人を削除
+    const expired = await pool.query('SELECT user_id, username, start, expected_end, note FROM active_users WHERE expected_end IS NOT NULL AND expected_end <= $1', [now]);
+    for (const r of expired.rows) {
       await pool.query(
         'INSERT INTO history(user_id, username, start, ended_at, note) VALUES($1,$2,$3,$4,$5)',
         [r.user_id, r.username, r.start, r.expected_end, r.note]
       );
       await pool.query('DELETE FROM active_users WHERE user_id = $1', [r.user_id]);
-
       await sendLog(`⏰ ${r.username} の利用時間が終了しました（開始: ${fmtTs(r.start)} → 自動終了: ${fmtHHMM(r.expected_end)}）。${r.note ? ` 📝: ${r.note}` : ''}`);
     }
+
     const panels = await pool.query('SELECT channel_id FROM panel');
     for (const p of panels.rows) await updatePanel(p.channel_id);
   } catch (err) {
-    console.error('auto-expire error:', err);
+    console.error('auto-check error:', err);
   }
 }, 60 * 1000);
 
-// --- Start up ---
+// --- Start ---
 (async () => {
   try {
     await initDb();
@@ -303,6 +345,8 @@ setInterval(async () => {
     process.exit(1);
   }
 })();
+
+
 
 
 
@@ -334,6 +378,14 @@ setInterval(async () => {
 
 // // --- Express ---
 // const app = express();
+// app.use(express.json());
+
+// // Ping 用エンドポイント（Discord Interaction）
+// // ここは Render 側で必須、署名検証は省略しています
+// app.post('/interactions', (req, res) => {
+//   res.json({ type: 1 }); // PONG
+// });
+
 // app.get('/', (req, res) => res.send('OK - office tracker'));
 // const PORT = process.env.PORT || 10000;
 
@@ -447,10 +499,10 @@ setInterval(async () => {
 //   }
 // }
 
-// // --- Interaction handling ---
+// // --- Discord Interaction handling ---
 // client.on('interactionCreate', async (interaction) => {
 //   try {
-//     // --- スラッシュコマンド ---
+//     // スラッシュコマンド
 //     if (interaction.isChatInputCommand()) {
 //       const cmd = interaction.commandName;
 //       if (cmd === 'setup-office') {
@@ -472,7 +524,7 @@ setInterval(async () => {
 //       }
 //     }
 
-//     // --- ボタン処理 ---
+//     // ボタン処理
 //     if (interaction.isButton()) {
 //       if (interaction.customId === 'office_join') {
 //         const modal = new ModalBuilder()
@@ -521,14 +573,8 @@ setInterval(async () => {
 //       }
 //     }
 
-//     // --- モーダル送信 ---
+//     // モーダル送信
 //     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'office_join_modal') {
-//       const exists = await pool.query('SELECT user_id FROM active_users WHERE user_id = $1', [interaction.user.id]);
-//       if (exists.rows.length) {
-//         await interaction.deferUpdate();
-//         return;
-//       }
-
 //       const endTimeText = interaction.fields.getTextInputValue('endTime') || '';
 //       const note = interaction.fields.getTextInputValue('note') || '';
 //       let expectedEnd = null;
@@ -539,24 +585,18 @@ setInterval(async () => {
 //           const hh = parseInt(m[1], 10);
 //           const mm = parseInt(m[2], 10);
 
-//           // JST基準
+//           // JST 時間処理
 //           const now = new Date();
-//           const nowJST = new Date(now.getTime() + 9 * 3600 * 1000);
-
+//           const jstNow = new Date(now.getTime() + 9 * 3600 * 1000);
 //           const endJST = new Date(Date.UTC(
-//             nowJST.getUTCFullYear(),
-//             nowJST.getUTCMonth(),
-//             nowJST.getUTCDate(),
+//             jstNow.getUTCFullYear(),
+//             jstNow.getUTCMonth(),
+//             jstNow.getUTCDate(),
 //             hh,
 //             mm,
-//             0,
 //             0
 //           ));
-
-//           if (endJST.getTime() <= nowJST.getTime()) {
-//             endJST.setUTCDate(endJST.getUTCDate() + 1);
-//           }
-
+//           if (endJST.getTime() <= jstNow.getTime()) endJST.setUTCDate(endJST.getUTCDate() + 1);
 //           expectedEnd = Math.floor(endJST.getTime() / 1000 - 9 * 3600);
 //         }
 //       }
@@ -583,7 +623,7 @@ setInterval(async () => {
 //   }
 // });
 
-// // --- auto-expire scheduled check every minute ---
+// // --- 自動終了チェック（1分ごと） ---
 // setInterval(async () => {
 //   try {
 //     const now = Math.floor(Date.now() / 1000);
@@ -604,10 +644,9 @@ setInterval(async () => {
 //   }
 // }, 60 * 1000);
 
-// // --- start up ---
+// // --- Start up ---
 // (async () => {
 //   try {
-//     if (!process.env.DATABASE_URL) console.warn('DATABASE_URL not set — DB operations will fail until you set it.');
 //     await initDb();
 //     app.listen(PORT, '0.0.0.0', () => console.log(`HTTP server listening on ${PORT}`));
 //     await client.login(DISCORD_TOKEN);
@@ -617,7 +656,4 @@ setInterval(async () => {
 //     process.exit(1);
 //   }
 // })();
-
-
-
 
